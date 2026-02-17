@@ -3,7 +3,7 @@ use axum::{
     extract::Query,
     http::{header, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use bytes::Bytes;
@@ -16,6 +16,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tracing::{error, info};
+
+mod hands;
 
 #[derive(Debug, Deserialize)]
 struct StreamParams {
@@ -78,12 +80,12 @@ fn capture_jpeg_real(quality: u8) -> Result<Vec<u8>, String> {
 
     let (w, h) = (capturer.width(), capturer.height());
 
-    // scrap returns BGRA.
-    let mut frame = None;
+    // scrap returns BGRA. We must copy the frame bytes because `frame()` borrows from `capturer`.
+    let mut frame_copy: Option<Vec<u8>> = None;
     for _ in 0..50 {
         match capturer.frame() {
             Ok(buf) => {
-                frame = Some(buf);
+                frame_copy = Some(buf.to_vec());
                 break;
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -93,7 +95,7 @@ fn capture_jpeg_real(quality: u8) -> Result<Vec<u8>, String> {
             Err(e) => return Err(format!("frame: {e}")),
         }
     }
-    let frame = frame.ok_or_else(|| "frame: timeout".to_string())?;
+    let frame = frame_copy.ok_or_else(|| "frame: timeout".to_string())?;
 
     // Convert BGRA -> RGB
     let mut rgb = vec![0u8; w * h * 3];
@@ -129,7 +131,8 @@ async fn health() -> impl IntoResponse {
     #[cfg(not(feature = "capture"))]
     let capture = "disabled";
 
-    Json(json!({"ok": true, "bind": "127.0.0.1", "capture": capture}))
+    let hands = if cfg!(feature = "hands") { "available" } else { "disabled" };
+    Json(json!({"ok": true, "bind": "127.0.0.1", "capture": capture, "hands": hands}))
 }
 
 async fn snapshot() -> Response {
@@ -209,19 +212,36 @@ async fn stream_mjpeg(Query(params): Query<StreamParams>) -> Response {
 async fn main() {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
+    let hands_state = hands::HandsState::new();
+
     let app = Router::new()
         .route("/", get(health))
         .route("/health", get(health))
         .route("/snapshot.jpg", get(snapshot))
-        .route("/stream", get(stream_mjpeg));
+        .route("/stream", get(stream_mjpeg))
+        // Hands (input control) - guarded, local-only
+        .route("/hands/arm", post(hands::hands_arm))
+        .route("/hands/disarm", post(hands::hands_disarm))
+        .route("/hands/move", post(hands::hands_move))
+        .route("/hands/click", post(hands::hands_click))
+        .route("/hands/type", post(hands::hands_type))
+        .with_state(hands_state);
 
-    let bind_ip = std::env::var("SEEALLN_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let bind_ip_raw = std::env::var("SEEALLN_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let bind_ip = bind_ip_raw.trim();
+    let bind_ip = if bind_ip.is_empty() { "127.0.0.1" } else { bind_ip };
+
     let port: u16 = std::env::var("SEEALLN_PORT")
         .ok()
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.trim().parse().ok())
         .unwrap_or(8765);
 
-    let addr: SocketAddr = format!("{}:{}", bind_ip, port).parse().unwrap();
+    let addr: SocketAddr = format!("{}:{}", bind_ip, port)
+        .parse()
+        .unwrap_or_else(|_| {
+            // Defensive fallback
+            "127.0.0.1:8765".parse().expect("valid fallback socket")
+        });
     info!("SeeAlln Rust server listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
