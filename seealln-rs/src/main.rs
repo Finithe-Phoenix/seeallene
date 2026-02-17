@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::Query,
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -33,34 +33,110 @@ fn clamp<T: PartialOrd>(v: T, lo: T, hi: T) -> T {
     }
 }
 
-fn capture_jpeg(_quality: u8) -> Result<Vec<u8>, String> {
-    // NOTE: MVP placeholder image. Next step: real cross-platform capture.
-    let width = 640;
-    let height = 360;
-    let mut imgbuf = image::RgbImage::new(width, height);
-    for p in imgbuf.pixels_mut() {
-        *p = image::Rgb([16, 16, 20]);
+fn capture_jpeg(quality: u8) -> Result<Vec<u8>, String> {
+    // Real screen capture (native runs). In Docker/CI/headless, capture will likely fail.
+    // In those cases we fall back to a placeholder image and return a best-effort JPEG.
+
+    let quality = clamp(quality, 30, 90);
+
+    match capture_jpeg_real(quality) {
+        Ok(buf) => Ok(buf),
+        Err(err) => {
+            // Fallback placeholder (keeps endpoints stable)
+            let width = 640;
+            let height = 360;
+            let mut imgbuf = image::RgbImage::new(width, height);
+            for (i, p) in imgbuf.pixels_mut().enumerate() {
+                let x = (i as u32) % width;
+                let y = (i as u32) / width;
+                let v = (((x ^ y) & 0x3F) as u8).saturating_add(16);
+                *p = image::Rgb([v, v, v.saturating_add(8)]);
+            }
+
+            let mut out = Vec::new();
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
+            encoder
+                .encode_image(&image::DynamicImage::ImageRgb8(imgbuf))
+                .map_err(|e| e.to_string())?;
+
+            // Encode error info into a trailing marker for logs; response headers will also expose this.
+            error!(%err, "capture failed; serving placeholder");
+            Ok(out)
+        }
+    }
+}
+
+fn capture_jpeg_real(quality: u8) -> Result<Vec<u8>, String> {
+    use std::{io::ErrorKind, thread, time::Duration};
+
+    let display = scrap::Display::primary().map_err(|e| format!("display: {e}"))?;
+    let mut capturer = scrap::Capturer::new(display).map_err(|e| format!("capturer: {e}"))?;
+
+    let (w, h) = (capturer.width(), capturer.height());
+
+    // scrap returns BGRA.
+    let mut frame = None;
+    for _ in 0..50 {
+        match capturer.frame() {
+            Ok(buf) => {
+                frame = Some(buf);
+                break;
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(e) => return Err(format!("frame: {e}")),
+        }
+    }
+    let frame = frame.ok_or_else(|| "frame: timeout".to_string())?;
+
+    // Convert BGRA -> RGB
+    let mut rgb = vec![0u8; w * h * 3];
+    for i in 0..(w * h) {
+        let b = frame[i * 4];
+        let g = frame[i * 4 + 1];
+        let r = frame[i * 4 + 2];
+        rgb[i * 3] = r;
+        rgb[i * 3 + 1] = g;
+        rgb[i * 3 + 2] = b;
     }
 
+    let img = image::RgbImage::from_raw(w as u32, h as u32, rgb)
+        .ok_or_else(|| "rgb buffer: invalid".to_string())?;
+
     let mut out = Vec::new();
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 80);
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
     encoder
-        .encode_image(&image::DynamicImage::ImageRgb8(imgbuf))
+        .encode_image(&image::DynamicImage::ImageRgb8(img))
         .map_err(|e| e.to_string())?;
+
     Ok(out)
 }
 
 async fn health() -> impl IntoResponse {
-    Json(json!({"ok": true, "bind": "127.0.0.1"}))
+    // Best-effort: attempt to know if capture is likely to work.
+    let capture_ok = scrap::Display::primary().is_ok();
+    Json(json!({"ok": true, "bind": "127.0.0.1", "capture": if capture_ok {"ok"} else {"unavailable"}}))
 }
 
 async fn snapshot() -> Response {
+    // We always try to return a JPEG (real capture preferred; placeholder as fallback).
+    // Any hard failure returns 500.
     match capture_jpeg(75) {
         Ok(buf) => {
             let mut resp = Response::new(Body::from(buf));
+            resp.headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"));
+            // A hint for clients; real/placeholder is inferred from ability to open a Display.
+            let mode = if scrap::Display::primary().is_ok() {
+                "real_or_placeholder"
+            } else {
+                "placeholder"
+            };
             resp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("image/jpeg"),
+                HeaderName::from_static("x-seealln-capture"),
+                HeaderValue::from_static(mode),
             );
             resp
         }
