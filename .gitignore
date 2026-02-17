@@ -27,3 +27,6 @@ _snapshot*.jpg
 
 # Local config (may contain screen regions)
 config.json
+
+# Rust
+**/target/
