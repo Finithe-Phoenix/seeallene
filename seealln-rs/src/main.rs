@@ -34,38 +34,42 @@ fn clamp<T: PartialOrd>(v: T, lo: T, hi: T) -> T {
 }
 
 fn capture_jpeg(quality: u8) -> Result<Vec<u8>, String> {
-    // Real screen capture (native runs). In Docker/CI/headless, capture will likely fail.
-    // In those cases we fall back to a placeholder image and return a best-effort JPEG.
+    // Real screen capture when enabled; otherwise placeholder.
+    // We intentionally keep endpoints stable even when capture is disabled/unavailable.
 
     let quality = clamp(quality, 30, 90);
 
-    match capture_jpeg_real(quality) {
-        Ok(buf) => Ok(buf),
-        Err(err) => {
-            // Fallback placeholder (keeps endpoints stable)
-            let width = 640;
-            let height = 360;
-            let mut imgbuf = image::RgbImage::new(width, height);
-            for (i, p) in imgbuf.pixels_mut().enumerate() {
-                let x = (i as u32) % width;
-                let y = (i as u32) / width;
-                let v = (((x ^ y) & 0x3F) as u8).saturating_add(16);
-                *p = image::Rgb([v, v, v.saturating_add(8)]);
+    #[cfg(feature = "capture")]
+    {
+        match capture_jpeg_real(quality) {
+            Ok(buf) => return Ok(buf),
+            Err(err) => {
+                error!(%err, "capture failed; serving placeholder");
             }
-
-            let mut out = Vec::new();
-            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
-            encoder
-                .encode_image(&image::DynamicImage::ImageRgb8(imgbuf))
-                .map_err(|e| e.to_string())?;
-
-            // Encode error info into a trailing marker for logs; response headers will also expose this.
-            error!(%err, "capture failed; serving placeholder");
-            Ok(out)
         }
     }
+
+    // Fallback placeholder (keeps endpoints stable)
+    let width = 640;
+    let height = 360;
+    let mut imgbuf = image::RgbImage::new(width, height);
+    for (i, p) in imgbuf.pixels_mut().enumerate() {
+        let x = (i as u32) % width;
+        let y = (i as u32) / width;
+        let v = (((x ^ y) & 0x3F) as u8).saturating_add(16);
+        *p = image::Rgb([v, v, v.saturating_add(8)]);
+    }
+
+    let mut out = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
+    encoder
+        .encode_image(&image::DynamicImage::ImageRgb8(imgbuf))
+        .map_err(|e| e.to_string())?;
+
+    Ok(out)
 }
 
+#[cfg(feature = "capture")]
 fn capture_jpeg_real(quality: u8) -> Result<Vec<u8>, String> {
     use std::{io::ErrorKind, thread, time::Duration};
 
@@ -115,9 +119,17 @@ fn capture_jpeg_real(quality: u8) -> Result<Vec<u8>, String> {
 }
 
 async fn health() -> impl IntoResponse {
-    // Best-effort: attempt to know if capture is likely to work.
-    let capture_ok = scrap::Display::primary().is_ok();
-    Json(json!({"ok": true, "bind": "127.0.0.1", "capture": if capture_ok {"ok"} else {"unavailable"}}))
+    #[cfg(feature = "capture")]
+    let capture = if scrap::Display::primary().is_ok() {
+        "ok"
+    } else {
+        "unavailable"
+    };
+
+    #[cfg(not(feature = "capture"))]
+    let capture = "disabled";
+
+    Json(json!({"ok": true, "bind": "127.0.0.1", "capture": capture}))
 }
 
 async fn snapshot() -> Response {
@@ -129,11 +141,15 @@ async fn snapshot() -> Response {
             resp.headers_mut()
                 .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"));
             // A hint for clients; real/placeholder is inferred from ability to open a Display.
+            #[cfg(feature = "capture")]
             let mode = if scrap::Display::primary().is_ok() {
                 "real_or_placeholder"
             } else {
                 "placeholder"
             };
+
+            #[cfg(not(feature = "capture"))]
+            let mode = "placeholder";
             resp.headers_mut().insert(
                 HeaderName::from_static("x-seealln-capture"),
                 HeaderValue::from_static(mode),

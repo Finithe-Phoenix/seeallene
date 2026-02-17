@@ -5,7 +5,9 @@ WORKDIR /app
 
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
-RUN cargo build --release
+# In Docker we disable the optional "capture" feature (scrap), because capture typically
+# requires OS/window-system deps not available in minimal containers.
+RUN cargo build --release --no-default-features
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
