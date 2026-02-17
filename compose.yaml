@@ -1,0 +1,11 @@
+services:
+  seealln:
+    build:
+      context: ./seealln-rs
+    environment:
+      SEEALLN_BIND: 0.0.0.0
+      SEEALLN_PORT: 8765
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:8765:8765"
+    restart: unless-stopped
