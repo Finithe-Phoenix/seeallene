@@ -23,11 +23,66 @@ struct HandsInner {
     // Simple rate limit: max actions within a window
     window_start: Option<Instant>,
     window_actions: u32,
+
+    // Safety kill switch: when true, all hands actions are forbidden.
+    killed: bool,
+
+    // Optional scope/region lock (inclusive min, exclusive max)
+    scope: Option<ScopeRect>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct ScopeRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+impl ScopeRect {
+    pub fn clamp_point(&self, x: i32, y: i32) -> (i32, i32) {
+        let min_x = self.x;
+        let min_y = self.y;
+        let max_x = self.x.saturating_add(self.w).saturating_sub(1);
+        let max_y = self.y.saturating_add(self.h).saturating_sub(1);
+        (x.clamp(min_x, max_x), y.clamp(min_y, max_y))
+    }
+
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        x >= self.x && y >= self.y && x < self.x.saturating_add(self.w) && y < self.y.saturating_add(self.h)
+    }
 }
 
 impl HandsState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn is_killed(&self) -> bool {
+        self.inner.lock().unwrap().killed
+    }
+
+    pub fn kill(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.killed = true;
+        inner.armed_until = None;
+        inner.token = None;
+        inner.window_start = None;
+        inner.window_actions = 0;
+    }
+
+    pub fn reset_kill(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.killed = false;
+    }
+
+    pub fn set_scope(&self, scope: Option<ScopeRect>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.scope = scope;
+    }
+
+    pub fn get_scope(&self) -> Option<ScopeRect> {
+        self.inner.lock().unwrap().scope
     }
 
     pub fn is_armed(&self, token: &str) -> bool {
@@ -54,7 +109,10 @@ impl HandsState {
     }
 
     pub fn consume_action(&self, token: &str) -> Result<(), &'static str> {
-        // Enforce arming + basic rate limiting to prevent runaway loops.
+        // Enforce kill switch + arming + basic rate limiting to prevent runaway loops.
+        if self.is_killed() {
+            return Err("killed");
+        }
         if !self.is_armed(token) {
             return Err("not armed");
         }
@@ -140,6 +198,74 @@ pub async fn hands_disarm(State(state): State<HandsState>, headers: HeaderMap) -
     (StatusCode::OK, Json(json!({"ok": true, "armed": false}))).into_response()
 }
 
+// Safety endpoints
+pub async fn safety_kill(State(state): State<HandsState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err((code, msg)) = require_local_only(&headers) {
+        return (code, Json(json!({"ok": false, "error": msg}))).into_response();
+    }
+    state.kill();
+    (StatusCode::OK, Json(json!({"ok": true, "killed": true}))).into_response()
+}
+
+pub async fn safety_reset(State(state): State<HandsState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err((code, msg)) = require_local_only(&headers) {
+        return (code, Json(json!({"ok": false, "error": msg}))).into_response();
+    }
+
+    // Extra confirm gate
+    let confirm = headers
+        .get("x-seealln-confirm")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false);
+    if !confirm {
+        return (
+            StatusCode::PRECONDITION_REQUIRED,
+            Json(json!({"ok": false, "error": "missing x-seealln-confirm: yes"})),
+        )
+            .into_response();
+    }
+
+    state.reset_kill();
+    (StatusCode::OK, Json(json!({"ok": true, "killed": false}))).into_response()
+}
+
+pub async fn safety_status(State(state): State<HandsState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err((code, msg)) = require_local_only(&headers) {
+        return (code, Json(json!({"ok": false, "error": msg}))).into_response();
+    }
+    (StatusCode::OK, Json(json!({"ok": true, "killed": state.is_killed(), "scope": state.get_scope()}))).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScopeReq {
+    // null to clear
+    scope: Option<ScopeRect>,
+}
+
+pub async fn scope_set(
+    State(state): State<HandsState>,
+    headers: HeaderMap,
+    Json(req): Json<ScopeReq>,
+) -> impl IntoResponse {
+    if let Err((code, msg)) = require_local_only(&headers) {
+        return (code, Json(json!({"ok": false, "error": msg}))).into_response();
+    }
+
+    if let Some(s) = req.scope {
+        if s.w <= 0 || s.h <= 0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": "invalid scope"})),
+            )
+                .into_response();
+        }
+    }
+
+    state.set_scope(req.scope);
+    (StatusCode::OK, Json(json!({"ok": true, "scope": state.get_scope()}))).into_response()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct MoveReq {
     // absolute screen coords
@@ -211,11 +337,31 @@ pub async fn hands_move(
     }
 
     // Guardrail: clamp to a sane range to avoid overflow; actual screen bounds are OS-specific.
-    let _x = req.x.clamp(-10_000, 10_000);
-    let _y = req.y.clamp(-10_000, 10_000);
+    let mut x = req.x.clamp(-10_000, 10_000);
+    let mut y = req.y.clamp(-10_000, 10_000);
+
+    // Apply scope (if set), otherwise clamp to main display.
+    #[cfg(feature = "hands")]
+    {
+        use enigo::{Enigo, Mouse, Settings};
+        let en = Enigo::new(&Settings::default()).map_err(|e| e.to_string());
+        if let Ok(mut enigo) = en {
+            if let Ok((w, h)) = enigo.main_display() {
+                // screen clamp
+                x = x.clamp(0, w.saturating_sub(1));
+                y = y.clamp(0, h.saturating_sub(1));
+            }
+        }
+
+        if let Some(scope) = state.get_scope() {
+            let (cx, cy) = scope.clamp_point(x, y);
+            x = cx;
+            y = cy;
+        }
+    }
 
     #[cfg(feature = "hands")]
-    match enigo_move(_x, _y) {
+    match enigo_move(x, y) {
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": err}))).into_response(),
     }

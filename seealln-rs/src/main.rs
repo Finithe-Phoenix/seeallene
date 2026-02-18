@@ -225,6 +225,12 @@ async fn main() {
         .route("/hands/move", post(hands::hands_move))
         .route("/hands/click", post(hands::hands_click))
         .route("/hands/type", post(hands::hands_type))
+
+        // Safety + scope
+        .route("/safety/kill", post(hands::safety_kill))
+        .route("/safety/reset", post(hands::safety_reset))
+        .route("/safety/status", get(hands::safety_status))
+        .route("/scope/set", post(hands::scope_set))
         .with_state(hands_state);
 
     let bind_ip_raw = std::env::var("SEEALLN_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
