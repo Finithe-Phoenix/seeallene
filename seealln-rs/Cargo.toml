@@ -24,8 +24,14 @@ scrap = { version = "0.5", optional = true }
 # Async stream
 futures = "0.3"
 
+# Input control (hands)
+# Enigo supports Windows/macOS/Linux. We'll keep it optional for safety.
+enigo = { version = "0.3", optional = true }
+
 [features]
 # Enable real screen capture. Disable in Docker builds.
 capture = ["dep:scrap"]
+# Enable native input control endpoints.
+hands = ["dep:enigo"]
 # Default on for native runs.
 default = ["capture"]

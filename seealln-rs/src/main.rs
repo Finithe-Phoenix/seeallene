@@ -132,7 +132,7 @@ async fn health() -> impl IntoResponse {
     let capture = "disabled";
 
     let hands = if cfg!(feature = "hands") { "available" } else { "disabled" };
-    Json(json!({"ok": true, "bind": "127.0.0.1", "capture": capture, "hands": hands}))
+    Json(json!({"ok": true, "bind": "127.0.0.1", "capture": capture, "hands": hands, "hands_policy": {"arming": "required", "confirm_header": "x-seealln-confirm: yes", "rate_limit": {"max_actions": std::env::var("SEEALLN_HANDS_MAX_ACTIONS").ok(), "window_ms": std::env::var("SEEALLN_HANDS_WINDOW_MS").ok()} } }))
 }
 
 async fn snapshot() -> Response {
